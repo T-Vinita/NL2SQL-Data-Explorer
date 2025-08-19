@@ -1,0 +1,25 @@
+# Data handling
+pandas
+numpy
+openpyxl    # for Excel reading/writing
+scikit-learn
+
+# Database
+mysql-connector-python
+sqlalchemy
+pyodbc      # if you want to use ODBC (optional)
+
+# Backend API
+fastapi
+uvicorn
+
+# OpenAI
+openai
+
+# Frontend Dashboard
+streamlit
+plotly
+altair
+
+# Misc
+python-dotenv   # for managing secrets (DB password, API key)
