@@ -1,0 +1,605 @@
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sqlalchemy import create_engine
+
+# === Step 1: Load Excel ===
+df = pd.read_excel(r"C:\Users\tvini\Desktop\genai_project\Sales Data.xlsx")
+
+# === Step 2: Clean columns ===
+# Remove any columns that start with 'Unnamed'
+df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
+df.columns = df.columns.str.strip().str.lower()
+df["product"] = df["product"].str.strip().str.title()
+df["city"] = df["city"].str.strip().str.title()
+df["purchase address"] = df["purchase address"].str.strip()
+
+# === Step 3: Convert date ===
+df["order date"] = pd.to_datetime(df["order date"], errors="coerce")
+df["order_date_only"] = df["order date"].dt.date
+df["order_time_only"] = df["order date"].dt.time
+
+# === Step 4: Standardize numeric cols ===
+num_cols = df.select_dtypes(include=['float64', 'int64']).columns.tolist()
+scaler = StandardScaler()
+df[[col + "_std" for col in num_cols]] = scaler.fit_transform(df[num_cols])
+
+# === Step 5: Save cleaned ===
+df.to_excel("normalized_sales.xlsx", index=False)
+
+# === Step 6: Upload to MySQL ===
+engine = create_engine('mysql+mysqlconnector://root:vinita2004@localhost/genai')
+df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+df.to_sql('sales_data_std', con=engine, if_exists='append', index=False, chunksize=10000)
+
+print("✅ Data preprocessing complete and uploaded to MySQL.")
+
+
+
+import mysql.connector
+from openai import OpenAI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import pandas as pd
+from datetime import datetime
+
+# === Config ===
+MYSQL_HOST = "localhost"
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "vinita2004"
+MYSQL_DATABASE = "genai"
+
+# ⚠️ Better: put this in .env
+OPENAI_API_KEY = "sk-proj-xxxx"
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# --- Helper: Generate SQL from NL question ---
+def generate_sql_from_question(question: str) -> str:
+    conn = mysql.connector.connect(
+        host=MYSQL_HOST,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE
+    )
+    cursor = conn.cursor()
+
+    # Fetch schema info
+    cursor.execute(f"""
+    SELECT table_name, column_name 
+    FROM information_schema.columns 
+    WHERE table_schema = '{MYSQL_DATABASE}'
+    """)
+    schema_info = cursor.fetchall()
+    schema_text = "\n".join([f"Table: {table}, Column: {col}" for table, col in schema_info])
+
+    # Prompt for LLM
+    prompt = f"""
+    You are an expert MySQL query generator.
+    Database schema:
+    {schema_text}
+
+    Convert the following request into a valid MySQL query:
+    "{question}"
+
+    Return ONLY the SQL query, nothing else.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    sql_query = response.choices[0].message.content.strip()
+
+    # Clean if wrapped in ```
+    if sql_query.startswith("```"):
+        sql_query = sql_query.split("```")[1].replace("sql", "").strip()
+
+    cursor.close()
+    conn.close()
+    return sql_query
+
+
+# === FastAPI App ===
+app = FastAPI()
+
+class QueryRequest(BaseModel):
+    question: str
+
+
+@app.post("/query/")
+async def query_database(request: QueryRequest):
+    """Convert natural language → SQL → MySQL results → Save to CSV."""
+    try:
+        sql_query = generate_sql_from_question(request.question)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SQL generation error: {str(e)}")
+
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE
+        )
+        cursor = conn.cursor()
+        cursor.execute(sql_query)
+
+        results = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        data = [dict(zip(columns, row)) for row in results]
+
+        # ✅ Save results to CSV (append mode with timestamp & question)
+        if data:
+            df = pd.DataFrame(data)
+            df["question"] = request.question
+            df["executed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            try:
+                existing = pd.read_csv("query_results.csv")
+                df = pd.concat([existing, df], ignore_index=True)
+            except FileNotFoundError:
+                pass
+
+            df.to_csv("query_results.csv", index=False)
+
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MySQL execution error: {str(e)}")
+
+    return {"sql_query": sql_query, "results": data}
+
+def suggest_chart(df: pd.DataFrame):
+    """Suggest a chart type based on dataframe structure."""
+    if df.empty:
+        return None
+
+    numeric_cols = df.select_dtypes(include=["int64", "float64"]).columns.tolist()
+    categorical_cols = df.select_dtypes(include=["object"]).columns.tolist()
+
+    # Rule 1: If we have time/date column → line chart
+    if any("date" in col.lower() for col in df.columns):
+        return {"type": "line", "x": df.columns[0], "y": numeric_cols[0] if numeric_cols else None}
+
+    # Rule 2: If categorical + numeric → bar chart
+    if categorical_cols and numeric_cols:
+        return {"type": "bar", "x": categorical_cols[0], "y": numeric_cols[0]}
+
+    # Rule 3: If only numeric → histogram
+    if numeric_cols:
+        return {"type": "histogram", "x": numeric_cols[0]}
+
+    # Default fallback → table
+    return {"type": "table"}
+
+
+@app.post("/query/")
+async def query_database(request: QueryRequest):
+    try:
+        sql_query = generate_sql_from_question(request.question)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SQL generation error: {str(e)}")
+
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST,
+            user=MYSQL_USER,
+            password=MYSQL_PASSWORD,
+            database=MYSQL_DATABASE
+        )
+        cursor = conn.cursor()
+        cursor.execute(sql_query)
+
+        results = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        data = [dict(zip(columns, row)) for row in results]
+
+        cursor.close()
+        conn.close()
+
+        # ✅ Save results for Streamlit dashboard
+        df = pd.DataFrame(data)
+        df.to_csv("query_results.csv", index=False)
+
+        # ✅ Chart suggestion
+        chart = suggest_chart(df)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MySQL execution error: {str(e)}")
+
+    return {"sql_query": sql_query, "results": data, "chart": chart}
+
+
+
+import streamlit as st
+import requests
+import pandas as pd
+import mysql.connector
+import plotly.express as px
+
+# === API Config ===
+API_URL = "http://127.0.0.1:8000/query/"
+
+# === Database Config ===
+MYSQL_HOST = "localhost"
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "ppppp"
+MYSQL_DATABASE = "genai"
+
+
+# === Load Sales Data from MySQL ===
+@st.cache_data(ttl=300)
+def load_data():
+    conn = mysql.connector.connect(
+        host=MYSQL_HOST,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE
+    )
+    query = "SELECT * FROM sales_data_std"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df
+
+
+# === Streamlit Layout ===
+st.set_page_config(page_title="Data Insights Assistant", layout="wide")
+st.title("🧠 GenAI-Powered Data Insights Tool")
+
+tab1, tab2 = st.tabs(["💬 NL → SQL Assistant", "📊 Sales Dashboard"])
+
+# -------------------------
+# Tab 1: NL → SQL Assistant
+# -------------------------
+with tab1:
+    st.subheader("Ask Questions in Natural Language")
+
+    # --- Suggested Questions ---
+    suggestions = [
+        "Show total sales by region",
+        "Top 5 products by revenue",
+        "Monthly sales trend for 2024",
+        "Customer count by segment",
+        "Average order value by category",
+        "Total profit by country",
+        "Year-over-year sales growth",
+        "Top 10 customers by purchase amount"
+    ]
+
+    st.markdown("💡 **Suggested Questions**")
+    cols = st.columns(2)
+    for i, q in enumerate(suggestions):
+        if cols[i % 2].button(q, key=f"suggest_{i}"):
+            st.session_state["user_question"] = q
+
+    # --- User Question Input (binded to session state) ---
+    user_question = st.text_area(
+        "Enter your question:",
+        key="user_question"   # ✅ now suggestions show instantly
+    )
+
+    if st.button("Run Query", key="run_query"):
+        if not user_question.strip():
+            st.warning("⚠️ Please enter a question.")
+        else:
+            with st.spinner("Querying database..."):
+                try:
+                    response = requests.post(API_URL, json={"question": user_question})
+                    response.raise_for_status()
+                    data = response.json()
+
+                    st.subheader("📝 Generated SQL")
+                    st.code(data.get("sql_query", ""), language="sql")
+
+                    results = data.get("results", [])
+                    if results:
+                        df = pd.DataFrame(results)
+                        st.subheader("📊 Results")
+                        st.dataframe(df, use_container_width=True)
+
+                        # ✅ Save in session state (shared with Tab 2)
+                        st.session_state["latest_results"] = df
+
+                        # ✅ Optional export for Power BI
+                        df.to_csv("query_results.csv", index=False)
+
+                        # --- Visualization Options ---
+                        numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
+                        if not df.empty and len(numeric_cols) > 0:
+                            st.subheader("📈 Quick Visualization")
+
+                            chart_type = st.selectbox(
+                                "Choose chart type:",
+                                ["Bar Chart", "Line Chart", "Pie Chart", "Table"],
+                                key="chart_type"
+                            )
+
+                            x_axis = st.selectbox("Select X-axis", df.columns, key="x_axis")
+                            y_axis = None
+                            if chart_type != "Pie Chart":
+                                y_axis = st.selectbox("Select Y-axis", numeric_cols, key="y_axis")
+
+                            if chart_type == "Bar Chart":
+                                fig = px.bar(df, x=x_axis, y=y_axis)
+                                st.plotly_chart(fig, use_container_width=True)
+                            elif chart_type == "Line Chart":
+                                fig = px.line(df, x=x_axis, y=y_axis)
+                                st.plotly_chart(fig, use_container_width=True)
+                            elif chart_type == "Pie Chart":
+                                fig = px.pie(df, names=x_axis, values=numeric_cols[0])
+                                st.plotly_chart(fig, use_container_width=True)
+                            else:
+                                st.dataframe(df, use_container_width=True)
+
+                    else:
+                        st.info("No results found.")
+
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+# -------------------------
+# Tab 2: Dashboard
+# -------------------------
+with tab2:
+    st.subheader("📊 Sales Dashboard")
+
+    # === Choose dataset ===
+    dataset_choice = st.radio(
+        "Select Dataset:",
+        ["Default Sales Data (MySQL)", "Latest Query Results (from NL → SQL)"],
+        horizontal=True
+    )
+
+    if dataset_choice == "Latest Query Results (from NL → SQL)" and "latest_results" in st.session_state:
+        df = st.session_state["latest_results"]
+        st.info("📂 Showing latest query results (from Tab 1)")
+    else:
+        df = load_data()
+        st.info("📂 Showing default dataset from MySQL (sales_data_std)")
+
+    st.write("### Preview of Data", df.head())
+
+    # === Filters (dynamic) ===
+    filtered_df = df.copy()
+    if "city" in df.columns:
+        city_filter = st.multiselect("🏙️ Filter by City", df["city"].unique())
+        if city_filter:
+            filtered_df = filtered_df[filtered_df["city"].isin(city_filter)]
+
+    if "product" in df.columns:
+        product_filter = st.multiselect("📦 Filter by Product", df["product"].unique())
+        if product_filter:
+            filtered_df = filtered_df[filtered_df["product"].isin(product_filter)]
+
+    # === Charts ===
+    st.markdown("---")
+    st.subheader("📊 Visualizations")
+
+    if "city" in filtered_df.columns and "sales" in filtered_df.columns:
+        st.subheader("📍 Total Sales by City")
+        fig_city = px.bar(filtered_df, x="city", y="sales", color="city", barmode="group")
+        st.plotly_chart(fig_city, use_container_width=True)
+
+    if "order_date_only" in filtered_df.columns and "sales" in filtered_df.columns:
+        st.subheader("📆 Sales Trend Over Time")
+        fig_time = px.line(
+            filtered_df,
+            x="order_date_only",
+            y="sales",
+            color="product" if "product" in filtered_df.columns else None,
+        )
+        st.plotly_chart(fig_time, use_container_width=True)
+
+    if "product" in filtered_df.columns and "sales" in filtered_df.columns:
+        st.subheader("📦 Product Performance")
+        fig_prod = px.pie(filtered_df, names="product", values="sales")
+        st.plotly_chart(fig_prod, use_container_width=True)
+
+        st.subheader("🏆 Top 10 Products by Sales")
+        top_products = filtered_df.groupby("product")["sales"].sum().nlargest(10).reset_index()
+        fig_top = px.bar(top_products, x="product", y="sales")
+        st.plotly_chart(fig_top, use_container_width=True)
+
+    if "region" in filtered_df.columns and "sales" in filtered_df.columns:
+        st.subheader("🌍 Sales by Region")
+        fig_region = px.bar(filtered_df, x="region", y="sales", color="region")
+        st.plotly_chart(fig_region, use_container_width=True)
+
+    if "customer_segment" in filtered_df.columns and "sales" in filtered_df.columns:
+        st.subheader("👥 Sales by Customer Segment")
+        fig_segment = px.pie(filtered_df, names="customer_segment", values="sales")
+        st.plotly_chart(fig_segment, use_container_width=True)
+
+
+
+import subprocess
+import time
+import requests
+import streamlit as st
+import mysql.connector
+import pandas as pd
+from openai import OpenAI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
+import threading
+import os
+import plotly.express as px   # ✅ for charts
+
+# ================= Backend (FastAPI) =================
+
+MYSQL_HOST = "localhost"
+MYSQL_USER = "root"
+MYSQL_PASSWORD = "ppppp"
+MYSQL_DATABASE = "genai"
+OPENAI_API_KEY = "sk-proj-xxxxx"
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+app = FastAPI()
+EXPORT_PATH = "query_results.csv"   # file for Power BI
+
+
+def generate_sql_from_question(question: str) -> str:
+    """Generate SQL query from natural language using OpenAI."""
+    conn = mysql.connector.connect(
+        host=MYSQL_HOST, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DATABASE
+    )
+    cursor = conn.cursor()
+
+    cursor.execute(f"""
+    SELECT table_name, column_name 
+    FROM information_schema.columns 
+    WHERE table_schema = '{MYSQL_DATABASE}'
+    """)
+    schema_info = cursor.fetchall()
+    schema_text = "\n".join([f"Table: {table}, Column: {col}" for table, col in schema_info])
+
+    prompt = f"""
+    You are an expert MySQL query generator.
+    Database schema:
+    {schema_text}
+
+    Convert the following request into a valid MySQL query:
+    "{question}"
+
+    Return ONLY the SQL query.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini", messages=[{"role": "user", "content": prompt}]
+    )
+    sql_query = response.choices[0].message.content.strip()
+
+    # Remove markdown formatting if present
+    if sql_query.startswith("```"):
+        sql_query = sql_query.split("```")[1].replace("sql", "").strip()
+
+    cursor.close()
+    conn.close()
+    return sql_query
+
+
+class QueryRequest(BaseModel):
+    question: str
+
+
+@app.post("/query/")
+async def query_database(request: QueryRequest):
+    """Generate SQL and fetch results from MySQL."""
+    try:
+        sql_query = generate_sql_from_question(request.question)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"SQL generation error: {str(e)}")
+
+    try:
+        conn = mysql.connector.connect(
+            host=MYSQL_HOST, user=MYSQL_USER, password=MYSQL_PASSWORD, database=MYSQL_DATABASE
+        )
+        cursor = conn.cursor()
+        cursor.execute(sql_query)
+
+        results = cursor.fetchall()
+        columns = [desc[0] for desc in cursor.description]
+        data = [dict(zip(columns, row)) for row in results]
+
+        cursor.close()
+        conn.close()
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"MySQL execution error: {str(e)}")
+
+    return {"sql_query": sql_query, "results": data}
+
+
+# Run FastAPI in background thread
+def run_backend():
+    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="info")
+
+
+threading.Thread(target=run_backend, daemon=True).start()
+time.sleep(2)  # wait for backend to start
+
+
+# ================= Frontend (Streamlit) =================
+
+st.set_page_config(page_title="🧠 NL → SQL Assistant", layout="wide")
+st.title("🧠 Natural Language → SQL ")
+
+# --- Suggested Questions ---
+suggestions = [
+    "Show total sales by region",
+    "Top 5 products by revenue",
+    "Monthly sales trend for 2024",
+    "Customer count by segment",
+    "Average order value by category",
+    "Total profit by country",
+]
+
+st.markdown("💡 **Suggested Questions**")
+cols = st.columns(3)
+for i, q in enumerate(suggestions):
+    if cols[i % 3].button(q, key=f"suggest_{i}"):
+        st.session_state["question"] = q
+
+# --- User Question ---
+question = st.text_input(
+    "Enter your question:",
+    value=st.session_state.get("question", "")
+)
+
+if st.button("Run Query") and question:
+    try:
+        response = requests.post("http://127.0.0.1:8000/query/", json={"question": question})
+        if response.status_code == 200:
+            data = response.json()
+
+            st.subheader("🔎 Generated SQL Query")
+            st.code(data["sql_query"], language="sql")
+
+            if data["results"]:
+                df = pd.DataFrame(data["results"])
+
+                # Save session state for re-use
+                st.session_state["latest_results"] = df
+
+                # Show in Streamlit
+                st.subheader("📊 Query Results")
+                st.dataframe(df, use_container_width=True)
+
+                # Save to CSV for Power BI
+                df.to_csv(EXPORT_PATH, index=False)
+                st.success(f"✅ Results saved to {os.path.abspath(EXPORT_PATH)} (refresh in Power BI)")
+
+                # --- Visualization Options ---
+                numeric_cols = df.select_dtypes(include=['int64', 'float64']).columns
+                if not df.empty and len(numeric_cols) > 0:
+                    st.subheader("📈 Visualization")
+
+                    chart_type = st.selectbox("Choose chart type:", ["Bar", "Line", "Pie", "Table"])
+                    x_axis = st.selectbox("Select X-axis", df.columns)
+                    y_axis = None
+                    if chart_type != "Pie":
+                        y_axis = st.selectbox("Select Y-axis", numeric_cols)
+
+                    if chart_type == "Bar":
+                        fig = px.bar(df, x=x_axis, y=y_axis)
+                        st.plotly_chart(fig, use_container_width=True)
+                    elif chart_type == "Line":
+                        fig = px.line(df, x=x_axis, y=y_axis)
+                        st.plotly_chart(fig, use_container_width=True)
+                    elif chart_type == "Pie":
+                        fig = px.pie(df, names=x_axis, values=numeric_cols[0])
+                        st.plotly_chart(fig, use_container_width=True)
+                    else:
+                        st.dataframe(df, use_container_width=True)
+
+            else:
+                st.warning("⚠️ No results found.")
+
+        else:
+            st.error(f"Error {response.status_code}: {response.json()['detail']}")
+
+    except Exception as e:
+        st.error(f"❌ Failed to connect to backend: {e}")
